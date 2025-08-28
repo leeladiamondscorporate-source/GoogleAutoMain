@@ -4,10 +4,10 @@ import ftplib
 import pandas as pd
 import hashlib
 import logging
+import re
 from datetime import datetime
 from google.cloud import storage
 from flask import jsonify
-import re
 from urllib.parse import quote
 
 # ----------------------------
@@ -36,7 +36,7 @@ FTP_PORT = 21
 FTP_USERNAME = "leeladiamondscorporate@gmail.com"
 FTP_PASSWORD = "1yH£lG4n0Mq"
 
-# Enhanced product configuration
+# Mapping product types to FTP file details and local save paths
 ftp_files = {
     "natural": {
         "remote_filename": "Leela Diamond_natural.csv",
@@ -117,7 +117,6 @@ SHAPE_CONFIG = {
         "category_path": "Jewelry & Watches > Fine Jewelry > Diamonds > Radiant",
         "keywords": ["radiant", "rectangular", "brilliant", "fire"]
     }
-    # Add more shapes as needed
 }
 
 # ----------------------------
@@ -126,7 +125,6 @@ SHAPE_CONFIG = {
 
 def generate_unique_id(row, product_type):
     """Generate a unique, consistent ID to prevent duplicates."""
-    # Create a hash from key identifying fields
     id_string = f"{row.get('ReportNo', '')}-{product_type}-{row.get('carats', '')}-{row.get('shape', '')}"
     return hashlib.md5(id_string.encode()).hexdigest()[:12].upper()
 
@@ -134,7 +132,6 @@ def sanitize_text(text):
     """Clean and sanitize text for SEO."""
     if pd.isna(text) or text == '':
         return ''
-    # Remove extra spaces, special characters that might cause issues
     text = re.sub(r'\s+', ' ', str(text).strip())
     text = re.sub(r'[^\w\s\-\.\,\(\)%]', '', text)
     return text
@@ -150,11 +147,44 @@ def format_price(price_value, apply_markup_func, convert_to_cad_func):
         cad_price = convert_to_cad_func(marked_up)
         return f"{cad_price:.2f} CAD"
     except Exception as e:
+        logger.error(f"Workflow failed: {e}")
+        return {
+            "status": "error",
+            "message": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
+
+# ----------------------------
+# CLOUD FUNCTION ENTRY POINT
+# ----------------------------
+
+def cloud_function_entry(request):
+    """HTTP Cloud Function entry point with enhanced error handling."""
+    try:
+        result = run_workflow()
+        status_code = 200 if result["status"] == "success" else 500
+        return jsonify(result), status_code
+    except Exception as e:
+        logger.error(f"Cloud function error: {e}")
+        return jsonify({
+            "status": "error", 
+            "message": f"Unexpected error: {str(e)}",
+            "timestamp": datetime.now().isoformat()
+        }), 500
+
+# ----------------------------
+# MAIN EXECUTION
+# ----------------------------
+
+if __name__ == "__main__":
+    # For local testing
+    result = run_workflow()
+    print(f"Result: {result}") Exception as e:
         logger.error(f"Error formatting price {price_value}: {e}")
         return "0.00 CAD"
 
 # ----------------------------
-# FTP DOWNLOAD FUNCTION
+# FTP FUNCTIONS
 # ----------------------------
 
 def explore_ftp_structure():
@@ -189,44 +219,6 @@ def explore_ftp_structure():
     except Exception as e:
         logger.error(f"Error exploring FTP structure: {e}")
         return []
-
-def find_diamond_files():
-    """Find diamond files on FTP server with flexible naming."""
-    try:
-        with ftplib.FTP() as ftp:
-            ftp.connect(FTP_SERVER, FTP_PORT, timeout=30)
-            ftp.login(FTP_USERNAME, FTP_PASSWORD)
-            
-            # Get all files
-            all_files = ftp.nlst()
-            logger.info(f"Total files on server: {len(all_files)}")
-            
-            # Look for files containing diamond-related keywords
-            found_files = {}
-            
-            for file in all_files:
-                file_lower = file.lower()
-                
-                # Check for natural diamonds
-                if any(keyword in file_lower for keyword in ['natural', 'mined']) and 'diamond' in file_lower:
-                    found_files['natural'] = file
-                    logger.info(f"Found natural diamond file: {file}")
-                
-                # Check for lab grown diamonds
-                elif any(keyword in file_lower for keyword in ['lab', 'labgrown', 'lab-grown', 'synthetic']) and 'diamond' in file_lower:
-                    found_files['lab_grown'] = file
-                    logger.info(f"Found lab grown diamond file: {file}")
-                
-                # Check for gemstones
-                elif any(keyword in file_lower for keyword in ['gemstone', 'gem', 'colored']) and not 'diamond' in file_lower:
-                    found_files['gemstone'] = file
-                    logger.info(f"Found gemstone file: {file}")
-            
-            return found_files
-            
-    except Exception as e:
-        logger.error(f"Error finding diamond files: {e}")
-        return {}
 
 def download_file_from_ftp(remote_filename, local_path):
     """Download a file from the FTP server with enhanced error handling."""
@@ -309,9 +301,9 @@ def download_all_files():
             logger.info(f"Downloading {product_type}: {remote_filename}")
             if download_file_from_ftp(remote_filename, local_path):
                 success_count += 1
-                logger.info(f"✅ Downloaded {product_type}: {remote_filename}")
+                logger.info(f"Downloaded {product_type}: {remote_filename}")
             else:
-                logger.error(f"❌ Failed to download {product_type}: {remote_filename}")
+                logger.error(f"Failed to download {product_type}: {remote_filename}")
         else:
             logger.warning(f"File not found on server: {remote_filename}")
     
@@ -324,7 +316,7 @@ def download_all_files():
 
 def convert_to_cad(price_usd):
     """Convert price from USD to CAD using current exchange rate."""
-    cad_rate = 1.46  # Consider making this dynamic from an API
+    cad_rate = 1.46
     try:
         return round(float(price_usd) * cad_rate, 2)
     except (ValueError, TypeError) as e:
@@ -574,87 +566,8 @@ def process_files_to_cad(files_to_load, output_file):
         logger.info(f"Combined {len(combined_df)} total products, removed {duplicate_count} cross-file duplicates")
         
         # Final data validation and cleaning
-        combined_df = combined_df[combined_df['price'] != '0.00 CAD']  # Remove zero-price items
-        combined_df = combined_df[combined_df['title'].str.len() > 10]  # Remove incomplete titles
-        
-        # Save to CSV with optimized settings
-        combined_df.to_csv(
-            output_file,
-            index=False,
-            quoting=csv.QUOTE_MINIMAL,
-            quotechar='"',
-            escapechar='\\',
-            encoding='utf-8'
-        )
-        
-        # Generate summary report
-        summary = {
-            'total_products': len(combined_df),
-            'by_type': combined_df['custom_label_0'].value_counts().to_dict(),
-            'price_ranges': {
-                'under_1000': len(combined_df[pd.to_numeric(combined_df['price'].str.replace(' CAD', ''), errors='coerce') < 1000]),
-                '1000_5000': len(combined_df[
-                    (pd.to_numeric(combined_df['price'].str.replace(' CAD', ''), errors='coerce') >= 1000) &
-                    (pd.to_numeric(combined_df['price'].str.replace(' CAD', ''), errors='coerce') < 5000)
-                ]),
-                'over_5000': len(combined_df[pd.to_numeric(combined_df['price'].str.replace(' CAD', ''), errors='coerce') >= 5000])
-            }
-        }
-        
-        logger.info(f"Processing complete: {summary}")
-        
-        # Save summary report
-        with open(os.path.join(local_output_directory, 'processing_summary.txt'), 'w') as f:
-            f.write(f"Processing Summary - {datetime.now()}\n")
-            f.write(f"Total products: {summary['total_products']}\n")
-            f.write(f"By type: {summary['by_type']}\n")
-            f.write(f"Price distribution: {summary['price_ranges']}\n")
-        
-        logger.info(f"Combined data saved to {output_file}")
-        
-    except Exception as e:
-        logger.error(f"Error in processing files: {e}")
-       combined_df = combined_df[combined_df['price'] != '0.00 CAD']  # Remove zero-price items
-        
-        # Save to CSV with optimized settings
-        combined_df.to_csv(
-            output_file,
-            index=False,
-            quoting=csv.QUOTE_MINIMAL,
-            quotechar='"',
-            escapechar='\\',
-            encoding='utf-8'
-        )
-        
-        # Generate summary report
-        summary = {
-            'total_products': len(combined_df),
-            'by_type': combined_df['custom_label_0'].value_counts().to_dict(),
-            'price_ranges': {
-                'under_1000': len(combined_df[pd.to_numeric(combined_df['price'].str.replace(' CAD', ''), errors='coerce') < 1000]),
-                '1000_5000': len(combined_df[
-                    (pd.to_numeric(combined_df['price'].str.replace(' CAD', ''), errors='coerce') >= 1000) &
-                    (pd.to_numeric(combined_df['price'].str.replace(' CAD', ''), errors='coerce') < 5000)
-                ]),
-                'over_5000': len(combined_df[pd.to_numeric(combined_df['price'].str.replace(' CAD', ''), errors='coerce') >= 5000])
-            }
-        }
-        
-        logger.info(f"Processing complete: {summary}")
-        
-        # Save summary report
-        with open(os.path.join(local_output_directory, 'processing_summary.txt'), 'w') as f:
-            f.write(f"Processing Summary - {datetime.now()}\n")
-            f.write(f"Total products: {summary['total_products']}\n")
-            f.write(f"By type: {summary['by_type']}\n")
-            f.write(f"Price distribution: {summary['price_ranges']}\n")
-        
-        logger.info(f"Combined data saved to {output_file}")
-        
-    except Exception as e:
-        logger.error(f"Error in processing files: {e}")
-        raise00 CAD']  # Remove zero-price items
-        combined_df = combined_df[combined_df['title'].str.len() > 10]  # Remove incomplete titles
+        combined_df = combined_df[combined_df['price'] != '0.00 CAD']
+        combined_df = combined_df[combined_df['title'].str.len() > 10]
         
         # Save to CSV with optimized settings
         combined_df.to_csv(
@@ -783,38 +696,4 @@ def run_workflow():
         logger.info(f"Workflow completed successfully in {duration}")
         return result
         
-    except Exception as e:
-        logger.error(f"Workflow failed: {e}")
-        return {
-            "status": "error",
-            "message": str(e),
-            "timestamp": datetime.now().isoformat()
-        }
-
-# ----------------------------
-# CLOUD FUNCTION ENTRY POINT
-# ----------------------------
-
-def cloud_function_entry(request):
-    """HTTP Cloud Function entry point with enhanced error handling."""
-    try:
-        result = run_workflow()
-        status_code = 200 if result["status"] == "success" else 500
-        return jsonify(result), status_code
-    except Exception as e:
-        logger.error(f"Cloud function error: {e}")
-        return jsonify({
-            "status": "error", 
-            "message": f"Unexpected error: {str(e)}",
-            "timestamp": datetime.now().isoformat()
-        }), 500
-
-# ----------------------------
-# MAIN EXECUTION
-# ----------------------------
-
-if __name__ == "__main__":
-    # For local testing
-    result = run_workflow()
-    print(f"Result: {result}")
-
+    except
