@@ -1,0 +1,33 @@
+name: Run Workflow Every Two Days
+
+on:
+  schedule:
+    - cron: '0 0 */2 * *'  # Runs at midnight every two days
+  workflow_dispatch:      # Allows manual triggering
+
+jobs:
+  run-script:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Set up Google Cloud Credentials
+        env:
+          GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
+        run: |
+          echo "$GCP_CREDENTIALS" > /tmp/gcp_credentials.json
+          export GOOGLE_APPLICATION_CREDENTIALS="/tmp/gcp_credentials.json"
+
+      - name: Run the script
+        run: python main.py
