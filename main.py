@@ -176,12 +176,11 @@ def cloud_function_entry(request):
 # MAIN EXECUTION
 # ----------------------------
 
+
 if __name__ == "__main__":
     # For local testing
     result = run_workflow()
-    print(f"Result: {result}") Exception as e:
-        logger.error(f"Error formatting price {price_value}: {e}")
-        return "0.00 CAD"
+    print(f"Result: {result}")
 
 # ----------------------------
 # FTP FUNCTIONS
