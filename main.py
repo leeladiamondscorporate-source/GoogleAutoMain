@@ -175,13 +175,16 @@ def explore_ftp_structure():
             for item in file_list:
                 logger.info(f"  {item}")
             
-            # Try to get simple file list
-            try:
-                files = ftp.nlst()
-                return files
-            except Exception as e:
-                logger.warning(f"Could not get file list: {e}")
-                return []
+            # Get simple file list using LIST instead of NLST to avoid the directory error
+            files = []
+            for line in file_list:
+                # Parse the LIST output to extract filenames
+                parts = line.split()
+                if len(parts) >= 9:  # Valid file listing
+                    filename = parts[-1]  # Last part is the filename
+                    files.append(filename)
+            
+            return files
                 
     except Exception as e:
         logger.error(f"Error exploring FTP structure: {e}")
@@ -292,43 +295,25 @@ def download_all_files():
         logger.error("Could not retrieve FTP file list")
         return 0
     
-    # Try to find files using flexible naming
-    found_files = find_diamond_files()
+    logger.info(f"Found {len(all_files)} files on FTP server:")
+    for file in all_files:
+        logger.info(f"  {file}")
     
-    if not found_files:
-        logger.warning("No diamond files found with automatic detection")
-        logger.info("Available files on FTP server:")
-        for file in all_files[:10]:  # Show first 10 files
-            logger.info(f"  {file}")
-        
-        # Try original file names as fallback
-        logger.info("Attempting original file names...")
-        success_count = 0
-        for product_type, file_info in ftp_files.items():
-            if download_file_from_ftp(file_info["remote_filename"], file_info["local_path"]):
-                success_count += 1
-        
-        return success_count
-    
-    # Download found files
+    # Download all available diamond files
     success_count = 0
-    for product_type, remote_filename in found_files.items():
-        if product_type in ftp_files:
-            local_path = ftp_files[product_type]["local_path"]
+    for product_type, file_info in ftp_files.items():
+        remote_filename = file_info["remote_filename"]
+        local_path = file_info["local_path"]
+        
+        if remote_filename in all_files:
+            logger.info(f"Downloading {product_type}: {remote_filename}")
             if download_file_from_ftp(remote_filename, local_path):
                 success_count += 1
                 logger.info(f"✅ Downloaded {product_type}: {remote_filename}")
             else:
                 logger.error(f"❌ Failed to download {product_type}: {remote_filename}")
         else:
-            logger.warning(f"Unknown product type found: {product_type}")
-    
-    # Try original names for any missing files
-    for product_type, file_info in ftp_files.items():
-        if not os.path.exists(file_info["local_path"]):
-            logger.info(f"Trying original filename for {product_type}...")
-            if download_file_from_ftp(file_info["remote_filename"], file_info["local_path"]):
-                success_count += 1
+            logger.warning(f"File not found on server: {remote_filename}")
     
     logger.info(f"Downloaded {success_count}/{len(ftp_files)} files successfully")
     return success_count
@@ -522,7 +507,7 @@ def process_files_to_cad(files_to_load, output_file):
             df['availability'] = 'in_stock'
             df['brand'] = 'Leela Diamonds'
             df['mpn'] = df['unique_id']
-            df['gtin'] = ''  # Add GTIN if available
+            df['gtin'] = ''
             df['condition'] = 'new'
             df['age_group'] = 'adult'
             df['gender'] = 'unisex'
@@ -543,20 +528,20 @@ def process_files_to_cad(files_to_load, output_file):
             )
             
             # Custom labels for Google Ads optimization
-            df['custom_label_0'] = product_type  # Product type
+            df['custom_label_0'] = product_type
             df['custom_label_1'] = df.apply(
                 lambda row: 'premium' if pd.to_numeric(row.get('price_numeric', 0), errors='coerce') > 5000 else 'standard',
                 axis=1
-            )  # Price tier
-            df['custom_label_2'] = df['shape']  # Shape
+            )
+            df['custom_label_2'] = df['shape']
             df['custom_label_3'] = df.apply(
                 lambda row: f"{row.get('carats', '0')[:3]}ct" if row.get('carats') else '',
                 axis=1
-            )  # Carat range
+            )
             df['custom_label_4'] = df.apply(
                 lambda row: f"{row.get('col', '')}-{row.get('clar', '')}",
                 axis=1
-            )  # Quality grade
+            )
             
             # Shipping information
             df['shipping'] = 'CA::Standard:0.00 CAD,CA::Express:25.00 CAD'
@@ -589,7 +574,87 @@ def process_files_to_cad(files_to_load, output_file):
         logger.info(f"Combined {len(combined_df)} total products, removed {duplicate_count} cross-file duplicates")
         
         # Final data validation and cleaning
-        combined_df = combined_df[combined_df['price'] != '0.00 CAD']  # Remove zero-price items
+        combined_df = combined_df[combined_df['price'] != '0.00 CAD']
+        combined_df = combined_df[combined_df['title'].str.len() > 10]
+        
+        # Save to CSV with optimized settings
+        combined_df.to_csv(
+            output_file,
+            index=False,
+            quoting=csv.QUOTE_MINIMAL,
+            quotechar='"',
+            escapechar='\\',
+            encoding='utf-8'
+        )
+        
+        # Generate summary report
+        summary = {
+            'total_products': len(combined_df),
+            'by_type': combined_df['custom_label_0'].value_counts().to_dict(),
+            'price_ranges': {
+                'under_1000': len(combined_df[pd.to_numeric(combined_df['price'].str.replace(' CAD', ''), errors='coerce') < 1000]),
+                '1000_5000': len(combined_df[
+                    (pd.to_numeric(combined_df['price'].str.replace(' CAD', ''), errors='coerce') >= 1000) &
+                    (pd.to_numeric(combined_df['price'].str.replace(' CAD', ''), errors='coerce') < 5000)
+                ]),
+                'over_5000': len(combined_df[pd.to_numeric(combined_df['price'].str.replace(' CAD', ''), errors='coerce') >= 5000])
+            }
+        }
+        
+        logger.info(f"Processing complete: {summary}")
+        
+        # Save summary report
+        with open(os.path.join(local_output_directory, 'processing_summary.txt'), 'w') as f:
+            f.write(f"Processing Summary - {datetime.now()}\n")
+            f.write(f"Total products: {summary['total_products']}\n")
+            f.write(f"By type: {summary['by_type']}\n")
+            f.write(f"Price distribution: {summary['price_ranges']}\n")
+        
+        logger.info(f"Combined data saved to {output_file}")
+        
+    except Exception as e:
+        logger.error(f"Error in processing files: {e}")
+        raise00 CAD']  # Remove zero-price items
+        combined_df = combined_df[combined_df['title'].str.len() > 10]  # Remove incomplete titles
+        
+        # Save to CSV with optimized settings
+        combined_df.to_csv(
+            output_file,
+            index=False,
+            quoting=csv.QUOTE_MINIMAL,
+            quotechar='"',
+            escapechar='\\',
+            encoding='utf-8'
+        )
+        
+        # Generate summary report
+        summary = {
+            'total_products': len(combined_df),
+            'by_type': combined_df['custom_label_0'].value_counts().to_dict(),
+            'price_ranges': {
+                'under_1000': len(combined_df[pd.to_numeric(combined_df['price'].str.replace(' CAD', ''), errors='coerce') < 1000]),
+                '1000_5000': len(combined_df[
+                    (pd.to_numeric(combined_df['price'].str.replace(' CAD', ''), errors='coerce') >= 1000) &
+                    (pd.to_numeric(combined_df['price'].str.replace(' CAD', ''), errors='coerce') < 5000)
+                ]),
+                'over_5000': len(combined_df[pd.to_numeric(combined_df['price'].str.replace(' CAD', ''), errors='coerce') >= 5000])
+            }
+        }
+        
+        logger.info(f"Processing complete: {summary}")
+        
+        # Save summary report
+        with open(os.path.join(local_output_directory, 'processing_summary.txt'), 'w') as f:
+            f.write(f"Processing Summary - {datetime.now()}\n")
+            f.write(f"Total products: {summary['total_products']}\n")
+            f.write(f"By type: {summary['by_type']}\n")
+            f.write(f"Price distribution: {summary['price_ranges']}\n")
+        
+        logger.info(f"Combined data saved to {output_file}")
+        
+    except Exception as e:
+        logger.error(f"Error in processing files: {e}")
+        raise00 CAD']  # Remove zero-price items
         combined_df = combined_df[combined_df['title'].str.len() > 10]  # Remove incomplete titles
         
         # Save to CSV with optimized settings
