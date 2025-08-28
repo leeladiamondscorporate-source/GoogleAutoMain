@@ -614,8 +614,7 @@ def process_files_to_cad(files_to_load, output_file):
         
     except Exception as e:
         logger.error(f"Error in processing files: {e}")
-        raise00 CAD']  # Remove zero-price items
-        combined_df = combined_df[combined_df['title'].str.len() > 10]  # Remove incomplete titles
+       combined_df = combined_df[combined_df['price'] != '0.00 CAD']  # Remove zero-price items
         
         # Save to CSV with optimized settings
         combined_df.to_csv(
@@ -818,3 +817,4 @@ if __name__ == "__main__":
     # For local testing
     result = run_workflow()
     print(f"Result: {result}")
+
