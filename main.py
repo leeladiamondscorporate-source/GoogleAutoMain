@@ -157,33 +157,178 @@ def format_price(price_value, apply_markup_func, convert_to_cad_func):
 # FTP DOWNLOAD FUNCTION
 # ----------------------------
 
-def download_file_from_ftp(remote_filename, local_path):
-    """Download a file from the FTP server with error handling."""
+def explore_ftp_structure():
+    """Explore FTP server structure to find files."""
     try:
         with ftplib.FTP() as ftp:
             ftp.connect(FTP_SERVER, FTP_PORT, timeout=30)
             ftp.login(FTP_USERNAME, FTP_PASSWORD)
             
-            # Check if file exists
-            file_list = ftp.nlst()
-            if remote_filename not in file_list:
-                logger.warning(f"File {remote_filename} not found on FTP server")
-                return False
+            logger.info(f"Connected to FTP server: {ftp.getwelcome()}")
+            logger.info(f"Current directory: {ftp.pwd()}")
+            
+            # List all files in current directory
+            file_list = []
+            ftp.retrlines('LIST', file_list.append)
+            
+            logger.info("FTP Directory contents:")
+            for item in file_list:
+                logger.info(f"  {item}")
+            
+            # Try to get simple file list
+            try:
+                files = ftp.nlst()
+                return files
+            except Exception as e:
+                logger.warning(f"Could not get file list: {e}")
+                return []
                 
+    except Exception as e:
+        logger.error(f"Error exploring FTP structure: {e}")
+        return []
+
+def find_diamond_files():
+    """Find diamond files on FTP server with flexible naming."""
+    try:
+        with ftplib.FTP() as ftp:
+            ftp.connect(FTP_SERVER, FTP_PORT, timeout=30)
+            ftp.login(FTP_USERNAME, FTP_PASSWORD)
+            
+            # Get all files
+            all_files = ftp.nlst()
+            logger.info(f"Total files on server: {len(all_files)}")
+            
+            # Look for files containing diamond-related keywords
+            found_files = {}
+            
+            for file in all_files:
+                file_lower = file.lower()
+                
+                # Check for natural diamonds
+                if any(keyword in file_lower for keyword in ['natural', 'mined']) and 'diamond' in file_lower:
+                    found_files['natural'] = file
+                    logger.info(f"Found natural diamond file: {file}")
+                
+                # Check for lab grown diamonds
+                elif any(keyword in file_lower for keyword in ['lab', 'labgrown', 'lab-grown', 'synthetic']) and 'diamond' in file_lower:
+                    found_files['lab_grown'] = file
+                    logger.info(f"Found lab grown diamond file: {file}")
+                
+                # Check for gemstones
+                elif any(keyword in file_lower for keyword in ['gemstone', 'gem', 'colored']) and not 'diamond' in file_lower:
+                    found_files['gemstone'] = file
+                    logger.info(f"Found gemstone file: {file}")
+            
+            return found_files
+            
+    except Exception as e:
+        logger.error(f"Error finding diamond files: {e}")
+        return {}
+
+def download_file_from_ftp(remote_filename, local_path):
+    """Download a file from the FTP server with enhanced error handling."""
+    try:
+        logger.info(f"Attempting to download: {remote_filename}")
+        
+        with ftplib.FTP() as ftp:
+            # Set passive mode (helps with firewall issues)
+            ftp.set_pasv(True)
+            
+            ftp.connect(FTP_SERVER, FTP_PORT, timeout=30)
+            ftp.login(FTP_USERNAME, FTP_PASSWORD)
+            
+            # Verify file exists and get size
+            try:
+                file_size = ftp.size(remote_filename)
+                logger.info(f"File {remote_filename} found, size: {file_size} bytes")
+            except ftplib.error_perm as e:
+                if "550" in str(e):
+                    logger.error(f"File not found: {remote_filename}")
+                    
+                    # Try to find similar files
+                    logger.info("Searching for similar files...")
+                    files = ftp.nlst()
+                    similar_files = [f for f in files if any(word in f.lower() for word in remote_filename.lower().split('_'))]
+                    
+                    if similar_files:
+                        logger.info(f"Similar files found: {similar_files}")
+                    else:
+                        logger.info("No similar files found")
+                    
+                    return False
+                else:
+                    logger.warning(f"Could not get file size: {e}")
+            
+            # Download the file
             with open(local_path, 'wb') as f:
                 ftp.retrbinary(f"RETR {remote_filename}", f.write)
-            logger.info(f"Downloaded {remote_filename} to {local_path}")
-            return True
+            
+            # Verify download success
+            if os.path.exists(local_path):
+                downloaded_size = os.path.getsize(local_path)
+                logger.info(f"Successfully downloaded {remote_filename}: {downloaded_size} bytes")
+                return True
+            else:
+                logger.error(f"Download failed: {remote_filename}")
+                return False
+                
+    except ftplib.error_perm as e:
+        logger.error(f"FTP Permission error downloading {remote_filename}: {e}")
+        return False
+    except ftplib.error_temp as e:
+        logger.error(f"FTP Temporary error downloading {remote_filename}: {e}")
+        return False
     except Exception as e:
-        logger.error(f"Error downloading {remote_filename}: {e}")
+        logger.error(f"Unexpected error downloading {remote_filename}: {e}")
         return False
 
 def download_all_files():
-    """Download all defined files from the FTP server."""
+    """Download all defined files from the FTP server with smart file discovery."""
+    logger.info("Starting file download process...")
+    
+    # First, explore the FTP structure
+    all_files = explore_ftp_structure()
+    if not all_files:
+        logger.error("Could not retrieve FTP file list")
+        return 0
+    
+    # Try to find files using flexible naming
+    found_files = find_diamond_files()
+    
+    if not found_files:
+        logger.warning("No diamond files found with automatic detection")
+        logger.info("Available files on FTP server:")
+        for file in all_files[:10]:  # Show first 10 files
+            logger.info(f"  {file}")
+        
+        # Try original file names as fallback
+        logger.info("Attempting original file names...")
+        success_count = 0
+        for product_type, file_info in ftp_files.items():
+            if download_file_from_ftp(file_info["remote_filename"], file_info["local_path"]):
+                success_count += 1
+        
+        return success_count
+    
+    # Download found files
     success_count = 0
+    for product_type, remote_filename in found_files.items():
+        if product_type in ftp_files:
+            local_path = ftp_files[product_type]["local_path"]
+            if download_file_from_ftp(remote_filename, local_path):
+                success_count += 1
+                logger.info(f"✅ Downloaded {product_type}: {remote_filename}")
+            else:
+                logger.error(f"❌ Failed to download {product_type}: {remote_filename}")
+        else:
+            logger.warning(f"Unknown product type found: {product_type}")
+    
+    # Try original names for any missing files
     for product_type, file_info in ftp_files.items():
-        if download_file_from_ftp(file_info["remote_filename"], file_info["local_path"]):
-            success_count += 1
+        if not os.path.exists(file_info["local_path"]):
+            logger.info(f"Trying original filename for {product_type}...")
+            if download_file_from_ftp(file_info["remote_filename"], file_info["local_path"]):
+                success_count += 1
     
     logger.info(f"Downloaded {success_count}/{len(ftp_files)} files successfully")
     return success_count
