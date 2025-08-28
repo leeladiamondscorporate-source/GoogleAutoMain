@@ -2,11 +2,11 @@ name: Daily Feed Build (01:30 UTC) + Keepalive
 
 on:
   schedule:
-    - cron: "30 1 * * *"   # 01:30 UTC every day
-  workflow_dispatch:        # allow manual runs
+    - cron: "30 1 * * *"   # 01:30 UTC daily
+  workflow_dispatch:
 
 permissions:
-  contents: write           # needed for keepalive commit
+  contents: write   # needed for keepalive commit
   actions: read
 
 concurrency:
@@ -35,11 +35,16 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Write Google Cloud credentials
-        if: ${{ secrets.GCP_CREDENTIALS != '' }}
+      # Write GCP key if the secret exists (no expression in "if:" to avoid parser issues)
+      - name: Write Google Cloud credentials (optional)
         run: |
-          echo "${{ secrets.GCP_CREDENTIALS }}" > "$RUNNER_TEMP/gcp.json"
-          echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/gcp.json" >> "$GITHUB_ENV"
+          if [ -n "${{ secrets.GCP_CREDENTIALS }}" ]; then
+            echo "${{ secrets.GCP_CREDENTIALS }}" > "$RUNNER_TEMP/gcp.json"
+            echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/gcp.json" >> "$GITHUB_ENV"
+            echo "GCP key written."
+          else
+            echo "No GCP_CREDENTIALS secret; skipping key write."
+          fi
 
       - name: Run the script
         env:
@@ -49,17 +54,13 @@ jobs:
         run: |
           python main.py
 
-      # --- Keep the repo "active" so schedules don't auto-disable after 60 days ---
-      # We only commit on the 1st of each month (UTC) to avoid noisy commit history.
-      - name: Monthly keepalive commit (1st of month, UTC)
-        if: ${{ startsWith(github.event_name, 'schedule') && (fromJSON('["' + steps.date.outputs.day + '"]')[0] == '01') }}
-        id: keepalive
-        run: |
-          echo "DAY=$(date -u +%d)" >> "$GITHUB_OUTPUT"
-        shell: bash
+      # --- Keepalive logic: get UTC day, commit only on 01st and only for scheduled runs ---
+      - name: Get current UTC day
+        id: day
+        run: echo "day=$(date -u +%d)" >> "$GITHUB_OUTPUT"
 
-      - name: Commit keepalive file
-        if: ${{ steps.keepalive.outputs.DAY == '01' }}
+      - name: Monthly keepalive commit (1st of month, UTC)
+        if: ${{ github.event_name == 'schedule' && steps.day.outputs.day == '01' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
