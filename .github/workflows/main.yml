@@ -1,451 +1,78 @@
-name: 🚀 Daily Google Merchant Feed Generator
+name: Daily Feed Build (01:30 UTC) + Keepalive
 
 on:
   schedule:
-    # Run daily at 2:30 AM UTC (optimal time - low traffic, fresh data)
-    - cron: "30 2 * * *"
-  workflow_dispatch:
-    # Allow manual runs with optional parameters
-    inputs:
-      force_run:
-        description: 'Force run even if recent run exists'
-        required: false
-        default: 'false'
-        type: boolean
-      debug_mode:
-        description: 'Enable debug logging'
-        required: false
-        default: 'false'
-        type: boolean
-      skip_upload:
-        description: 'Skip upload to Google Cloud (for testing)'
-        required: false
-        default: 'false'
-        type: boolean
+    - cron: "30 1 * * *"   # 01:30 UTC every day
+  workflow_dispatch:        # allow manual runs
 
-env:
-  PYTHON_VERSION: '3.11'
-  BUCKET_NAME: sitemaps.leeladiamond.com
-  BUCKET_FOLDER: Googlefinal
-  TIMEZONE: 'America/Toronto'
+permissions:
+  contents: write           # needed for keepalive commit
+  actions: read
+
+concurrency:
+  group: daily-feed
+  cancel-in-progress: false
 
 jobs:
-  # Pre-flight checks
-  preflight:
-    name: 🔍 Pre-flight Checks
+  run-script:
     runs-on: ubuntu-latest
-    outputs:
-      should_run: ${{ steps.check.outputs.should_run }}
-      last_run: ${{ steps.check.outputs.last_run }}
+    timeout-minutes: 30
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          persist-credentials: true
 
-      - name: Check if we should run
-        id: check
-        run: |
-          # Check if workflow ran successfully in last 20 hours (unless force_run is true)
-          if [[ "${{ github.event.inputs.force_run }}" == "true" ]]; then
-            echo "Force run enabled, proceeding..."
-            echo "should_run=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          
-          # Get last successful run time
-          LAST_SUCCESS=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/runs?status=success&per_page=1" | \
-            jq -r '.workflow_runs[0].created_at // empty')
-          
-          if [[ -n "$LAST_SUCCESS" ]]; then
-            LAST_RUN_EPOCH=$(date -d "$LAST_SUCCESS" +%s)
-            CURRENT_EPOCH=$(date +%s)
-            HOURS_DIFF=$(( (CURRENT_EPOCH - LAST_RUN_EPOCH) / 3600 ))
-            
-            echo "Last successful run: $LAST_SUCCESS ($HOURS_DIFF hours ago)"
-            echo "last_run=$LAST_SUCCESS" >> $GITHUB_OUTPUT
-            
-            if [[ $HOURS_DIFF -lt 20 ]]; then
-              echo "Recent successful run found, skipping..."
-              echo "should_run=false" >> $GITHUB_OUTPUT
-            else
-              echo "No recent successful run, proceeding..."
-              echo "should_run=true" >> $GITHUB_OUTPUT
-            fi
-          else
-            echo "No previous successful runs found, proceeding..."
-            echo "should_run=true" >> $GITHUB_OUTPUT
-          fi
-
-  # Main processing job
-  process-merchant-feed:
-    name: 📦 Generate Merchant Feed
-    runs-on: ubuntu-latest
-    needs: preflight
-    if: needs.preflight.outputs.should_run == 'true'
-    timeout-minutes: 45
-    
-    strategy:
-      fail-fast: false
-      
-    steps:
-      - name: 📥 Checkout repository
-        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          python-version: "3.11"
+          cache: "pip"
 
-      - name: 🐍 Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
-          cache-dependency-path: 'requirements.txt'
-
-      - name: 📋 Create requirements.txt if missing
+      - name: Install dependencies
         run: |
-          if [[ ! -f requirements.txt ]]; then
-            cat > requirements.txt << 'EOF'
-          pandas>=2.0.0
-          google-cloud-storage>=2.10.0
-          flask>=2.3.0
-          requests>=2.31.0
-          python-dateutil>=2.8.2
-          pytz>=2023.3
-          EOF
-            echo "Created requirements.txt with essential dependencies"
-          fi
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: 📦 Install dependencies with caching
+      - name: Write Google Cloud credentials
+        if: ${{ secrets.GCP_CREDENTIALS != '' }}
         run: |
-          pip install --upgrade pip setuptools wheel
-          pip install -r requirements.txt
-          pip install psutil
+          echo "${{ secrets.GCP_CREDENTIALS }}" > "$RUNNER_TEMP/gcp.json"
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/gcp.json" >> "$GITHUB_ENV"
 
-      - name: 🔧 Setup system timezone
-        run: |
-          sudo timedatectl set-timezone ${{ env.TIMEZONE }}
-          date
-
-      - name: 🔐 Configure Google Cloud credentials
+      - name: Run the script
         env:
-          GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ env.GOOGLE_APPLICATION_CREDENTIALS }}
+          BUCKET_NAME: sitemaps.leeladiamond.com
+          BUCKET_FOLDER: Googlefinal
         run: |
-          echo "$GCP_CREDENTIALS" > /tmp/gcp_credentials.json
-          chmod 600 /tmp/gcp_credentials.json
-          
-          # Validate credentials
-          if ! python -c "
-          import json
-          with open('/tmp/gcp_credentials.json') as f:
-              data = json.load(f)
-          assert 'project_id' in data, 'Invalid GCP credentials format'
-          print('✅ GCP credentials validated')
-          "; then
-            echo "❌ Invalid GCP credentials"
-            exit 1
-          fi
+          python main.py
 
-      - name: 🔍 System diagnostics
-        if: github.event.inputs.debug_mode == 'true'
+      # --- Keep the repo "active" so schedules don't auto-disable after 60 days ---
+      # We only commit on the 1st of each month (UTC) to avoid noisy commit history.
+      - name: Monthly keepalive commit (1st of month, UTC)
+        if: ${{ startsWith(github.event_name, 'schedule') && (fromJSON('["' + steps.date.outputs.day + '"]')[0] == '01') }}
+        id: keepalive
         run: |
-          echo "=== System Information ==="
-          uname -a
-          python --version
-          pip list
-          df -h
-          free -h
-          echo "=========================="
+          echo "DAY=$(date -u +%d)" >> "$GITHUB_OUTPUT"
+        shell: bash
 
-      - name: 🏃‍♂️ Execute merchant feed generation
-        id: execute
+      - name: Commit keepalive file
+        if: ${{ steps.keepalive.outputs.DAY == '01' }}
         env:
-          GOOGLE_APPLICATION_CREDENTIALS: /tmp/gcp_credentials.json
-          BUCKET_NAME: ${{ env.BUCKET_NAME }}
-          BUCKET_FOLDER: ${{ env.BUCKET_FOLDER }}
-          LOCAL_OUTPUT_DIRECTORY: /tmp/output
-          FTP_DOWNLOAD_DIR: /tmp/ftp
-          DEBUG_MODE: ${{ github.event.inputs.debug_mode }}
-          SKIP_UPLOAD: ${{ github.event.inputs.skip_upload }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
-          
-          # Create output directories
-          mkdir -p /tmp/output /tmp/ftp /tmp/logs
-          
-          # Set up logging
-          exec 1> >(tee -a /tmp/logs/execution.log)
-          exec 2> >(tee -a /tmp/logs/error.log >&2)
-          
-          echo "🚀 Starting merchant feed generation at $(date)"
-          echo "📍 Working directory: $(pwd)"
-          echo "🔧 Environment variables configured"
-          
-          # Monitor system resources during execution
-          if [[ "$DEBUG_MODE" == "true" ]]; then
-            (
-              while true; do
-                echo "$(date): CPU: $(top -bn1 | grep "Cpu(s)" | awk '{print $2}'), Memory: $(free | grep Mem | awk '{printf "%.1f%%", $3/$2 * 100.0}')"
-                sleep 30
-              done
-            ) &
-            MONITOR_PID=$!
-          fi
-          
-          # Run the main script
-          python main.py
-          
-          # Stop monitoring if it was started
-          if [[ -n "${MONITOR_PID:-}" ]]; then
-            kill $MONITOR_PID 2>/dev/null || true
-          fi
-          
-          echo "✅ Merchant feed generation completed at $(date)"
-          
-          # Capture metrics
-          if [[ -f /tmp/output/combined_google_merchant_feed.csv ]]; then
-            FILE_SIZE=$(stat -c%s /tmp/output/combined_google_merchant_feed.csv 2>/dev/null || echo "0")
-            PRODUCT_COUNT=$(tail -n +2 /tmp/output/combined_google_merchant_feed.csv | wc -l)
-            echo "📊 Generated file size: $(numfmt --to=iec $FILE_SIZE)"
-            echo "📦 Product count: $PRODUCT_COUNT"
-            echo "file_size=$FILE_SIZE" >> $GITHUB_OUTPUT
-            echo "product_count=$PRODUCT_COUNT" >> $GITHUB_OUTPUT
+          ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          mkdir -p .github
+          echo "$ts" > .github/keepalive
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/keepalive
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
           else
-            echo "❌ Output file not found!"
-            exit 1
-          fi
-
-      - name: 📊 Upload logs as artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: execution-logs-${{ github.run_id }}
-          path: /tmp/logs/
-          retention-days: 30
-
-      - name: 📈 Performance summary
-        if: success()
-        run: |
-          echo "## 🎉 Workflow Execution Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| 📅 Execution Date | $(date) |" >> $GITHUB_STEP_SUMMARY
-          echo "| 📦 Products Processed | ${{ steps.execute.outputs.product_count }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 📊 File Size | $(numfmt --to=iec ${{ steps.execute.outputs.file_size }}) |" >> $GITHUB_STEP_SUMMARY
-          echo "| 🎯 Status | ✅ Success |" >> $GITHUB_STEP_SUMMARY
-
-      - name: 🧹 Cleanup sensitive files
-        if: always()
-        run: |
-          rm -f /tmp/gcp_credentials.json
-          rm -rf /tmp/ftp/* || true
-          echo "🧹 Cleanup completed"
-
-  # Notification and monitoring job
-  notify:
-    name: 📢 Notifications & Monitoring
-    runs-on: ubuntu-latest
-    needs: [preflight, process-merchant-feed]
-    if: always()
-    
-    steps:
-      - name: 📊 Determine workflow status
-        id: status
-        run: |
-          if [[ "${{ needs.process-merchant-feed.result }}" == "success" ]]; then
-            echo "status=success" >> $GITHUB_OUTPUT
-            echo "emoji=✅" >> $GITHUB_OUTPUT
-            echo "message=Daily merchant feed generated successfully" >> $GITHUB_OUTPUT
-          elif [[ "${{ needs.preflight.outputs.should_run }}" == "false" ]]; then
-            echo "status=skipped" >> $GITHUB_OUTPUT
-            echo "emoji=⏭️" >> $GITHUB_OUTPUT
-            echo "message=Skipped - recent successful run exists" >> $GITHUB_OUTPUT
-          else
-            echo "status=failure" >> $GITHUB_OUTPUT
-            echo "emoji=❌" >> $GITHUB_OUTPUT
-            echo "message=Merchant feed generation failed" >> $GITHUB_OUTPUT
-          fi
-
-      - name: 📝 Update repository status
-        if: steps.status.outputs.status == 'success'
-        run: |
-          mkdir -p .github/status
-          cat > .github/status/last_run.json << EOF
-          {
-            "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-            "status": "${{ steps.status.outputs.status }}",
-            "run_id": "${{ github.run_id }}",
-            "products": "${{ needs.process-merchant-feed.outputs.product_count || 0 }}",
-            "file_size": "${{ needs.process-merchant-feed.outputs.file_size || 0 }}"
-          }
-          EOF
-
-      # Slack notification - Fixed the secrets issue
-      - name: 💬 Send Slack notification
-        if: always()
-        uses: 8398a7/action-slack@v3
-        with:
-          status: custom
-          custom_payload: |
-            {
-              "text": "${{ steps.status.outputs.emoji }} ${{ steps.status.outputs.message }}",
-              "attachments": [{
-                "color": "${{ steps.status.outputs.status == 'success' && 'good' || steps.status.outputs.status == 'skipped' && 'warning' || 'danger' }}",
-                "fields": [
-                  {"title": "Repository", "value": "${{ github.repository }}", "short": true},
-                  {"title": "Run ID", "value": "${{ github.run_id }}", "short": true},
-                  {"title": "Trigger", "value": "${{ github.event_name }}", "short": true},
-                  {"title": "Status", "value": "${{ steps.status.outputs.status }}", "short": true}
-                ]
-              }]
-            }
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        continue-on-error: true
-
-  # Keep-alive job to prevent workflow disabling
-  keep-alive:
-    name: 🔄 Keep Workflow Active
-    runs-on: ubuntu-latest
-    if: always()
-    needs: [preflight]
-    
-    steps:
-      - name: 📥 Checkout to maintain repository activity
-        uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 1
-
-      - name: 🔄 Create activity to prevent workflow disabling
-        run: |
-          echo "=== Keep-Alive Maintenance ===" 
-          echo "Timestamp: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-          echo "Run ID: ${{ github.run_id }}"
-          echo "Repository: ${{ github.repository }}"
-          echo "Workflow: ${{ github.workflow }}"
-          
-          # Create/update a keep-alive file to maintain repository activity
-          mkdir -p .github/keep-alive
-          echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" > .github/keep-alive/last-activity.txt
-          
-          # Check if we need to commit (only if file changed)
-          if ! git diff --quiet .github/keep-alive/last-activity.txt 2>/dev/null; then
-            echo "📝 Updating keep-alive timestamp to maintain workflow"
-            
-            # Configure git for commits
-            git config --global user.name "github-actions[bot]"
-            git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            
-            # Commit the keep-alive file
-            git add .github/keep-alive/last-activity.txt
-            git commit -m "🤖 Keep-alive: $(date -u +"%Y-%m-%d %H:%M UTC")"
+            git commit -m "chore(keepalive): $ts"
             git push
-            
-            echo "✅ Keep-alive commit created successfully"
-          else
-            echo "⏭️ No keep-alive update needed"
           fi
-
-      - name: 📊 Workflow status monitoring
-        run: |
-          echo "=== Workflow Status Check ==="
-          
-          # Check recent workflow runs to monitor health
-          echo "Checking recent workflow activity..."
-          
-          # Get workflow runs from the last 30 days - simplified API call
-          RECENT_RUNS=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/runs?per_page=30" | \
-            jq -r '.workflow_runs | length')
-          
-          SUCCESS_COUNT=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/runs?status=success&per_page=30" | \
-            jq -r '.workflow_runs | length')
-          
-          echo "📊 Workflow Statistics (Recent):"
-          echo "   Total Runs: $RECENT_RUNS"
-          echo "   Successful: $SUCCESS_COUNT"
-          
-          if [[ $RECENT_RUNS -gt 0 ]]; then
-            SUCCESS_RATE=$((SUCCESS_COUNT * 100 / RECENT_RUNS))
-            echo "   Success Rate: $SUCCESS_RATE%"
-            
-            if [[ $SUCCESS_RATE -lt 80 ]]; then
-              echo "⚠️  Warning: Success rate below 80% - consider investigation"
-            else
-              echo "✅ Good success rate"
-            fi
-          else
-            echo "ℹ️  No recent runs to analyze"
-          fi
-
-      - name: 🚨 Alert on workflow disabling risk
-        run: |
-          # Check if we're approaching the 60-day limit
-          LAST_COMMIT=$(git log -1 --format="%ct")
-          CURRENT_TIME=$(date +%s)
-          DAYS_SINCE_COMMIT=$(( (CURRENT_TIME - LAST_COMMIT) / 86400 ))
-          
-          echo "📅 Days since last repository activity: $DAYS_SINCE_COMMIT"
-          
-          if [[ $DAYS_SINCE_COMMIT -gt 45 ]]; then
-            echo "🚨 WARNING: Approaching 60-day GitHub Actions disable limit!"
-            echo "   Repository will be marked inactive soon if no commits are made."
-            echo "   This workflow creates keep-alive commits to prevent disabling."
-          elif [[ $DAYS_SINCE_COMMIT -gt 30 ]]; then
-            echo "⚠️  Notice: Repository activity is getting low (${DAYS_SINCE_COMMIT} days)"
-            echo "   Keep-alive mechanism will maintain activity automatically."
-          else
-            echo "✅ Repository activity is healthy"
-          fi
-
-  # Health check job for long-term monitoring
-  health-check:
-    name: 🏥 System Health Check
-    runs-on: ubuntu-latest
-    if: github.event_name == 'schedule'
-    needs: [process-merchant-feed, keep-alive]
-    
-    steps:
-      - name: 📊 Analyze workflow health
-        run: |
-          # Check recent workflow success rate
-          SUCCESS_RATE=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/runs?per_page=10" | \
-            jq '[.workflow_runs[] | select(.conclusion == "success")] | length')
-          
-          echo "Recent success rate: $SUCCESS_RATE/10"
-          
-          if [[ $SUCCESS_RATE -lt 7 ]]; then
-            echo "⚠️ Warning: Low success rate detected ($SUCCESS_RATE/10)"
-            echo "Consider investigating recent failures"
-          else
-            echo "✅ Workflow health looks good"
-          fi
-
-      - name: 📈 Generate health report
-        run: |
-          echo "## 🏥 Workflow Health Report" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Last Execution**: $(date)" >> $GITHUB_STEP_SUMMARY
-          echo "- **Repository**: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Workflow**: Daily Google Merchant Feed Generator" >> $GITHUB_STEP_SUMMARY
-          echo "- **Status**: ${{ needs.process-merchant-feed.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 🛡️ Anti-Disabling Protection" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Keep-alive mechanism active" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Repository activity maintained automatically" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Workflow will continue running indefinitely" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 📋 Maintenance Checklist" >> $GITHUB_STEP_SUMMARY
-          echo "- [ ] Review error logs if failures occurred" >> $GITHUB_STEP_SUMMARY
-          echo "- [ ] Check Google Cloud Storage quotas" >> $GITHUB_STEP_SUMMARY
-          echo "- [ ] Verify FTP server connectivity" >> $GITHUB_STEP_SUMMARY
-          echo "- [ ] Update dependencies quarterly" >> $GITHUB_STEP_SUMMARY
-          echo "- [ ] Monitor keep-alive commits (should be automatic)" >> $GITHUB_STEP_SUMMARY
