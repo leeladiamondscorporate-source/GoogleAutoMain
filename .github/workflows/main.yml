@@ -27,7 +27,7 @@ env:
   PYTHON_VERSION: '3.11'
   BUCKET_NAME: sitemaps.leeladiamond.com
   BUCKET_FOLDER: Googlefinal
-  TIMEZONE: 'America/Toronto'  # Adjust to your business timezone
+  TIMEZONE: 'America/Toronto'
 
 jobs:
   # Pre-flight checks
@@ -41,7 +41,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Get full history for better checks
+          fetch-depth: 0
 
       - name: Check if we should run
         id: check
@@ -54,7 +54,8 @@ jobs:
           fi
           
           # Get last successful run time
-          LAST_SUCCESS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          LAST_SUCCESS=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${{ github.repository }}/actions/runs?status=success&per_page=1" | \
             jq -r '.workflow_runs[0].created_at // empty')
           
@@ -84,11 +85,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: preflight
     if: needs.preflight.outputs.should_run == 'true'
-    
-    # Add timeout to prevent hanging workflows
     timeout-minutes: 45
     
-    # Define strategy for retries
     strategy:
       fail-fast: false
       
@@ -102,7 +100,7 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'  # Cache pip dependencies
+          cache: 'pip'
           cache-dependency-path: 'requirements.txt'
 
       - name: 📋 Create requirements.txt if missing
@@ -123,7 +121,6 @@ jobs:
         run: |
           pip install --upgrade pip setuptools wheel
           pip install -r requirements.txt
-          # Install additional monitoring tools
           pip install psutil
 
       - name: 🔧 Setup system timezone
@@ -172,7 +169,7 @@ jobs:
           DEBUG_MODE: ${{ github.event.inputs.debug_mode }}
           SKIP_UPLOAD: ${{ github.event.inputs.skip_upload }}
         run: |
-          set -e  # Exit on any error
+          set -e
           
           # Create output directories
           mkdir -p /tmp/output /tmp/ftp /tmp/logs
@@ -208,7 +205,7 @@ jobs:
           
           # Capture metrics
           if [[ -f /tmp/output/combined_google_merchant_feed.csv ]]; then
-            FILE_SIZE=$(stat -f%z /tmp/output/combined_google_merchant_feed.csv 2>/dev/null || stat -c%s /tmp/output/combined_google_merchant_feed.csv)
+            FILE_SIZE=$(stat -c%s /tmp/output/combined_google_merchant_feed.csv 2>/dev/null || echo "0")
             PRODUCT_COUNT=$(tail -n +2 /tmp/output/combined_google_merchant_feed.csv | wc -l)
             echo "📊 Generated file size: $(numfmt --to=iec $FILE_SIZE)"
             echo "📦 Product count: $PRODUCT_COUNT"
@@ -221,7 +218,7 @@ jobs:
 
       - name: 📊 Upload logs as artifacts
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: execution-logs-${{ github.run_id }}
           path: /tmp/logs/
@@ -235,16 +232,15 @@ jobs:
           echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| 📅 Execution Date | $(date) |" >> $GITHUB_STEP_SUMMARY
-          echo "| ⏱️ Duration | ${{ job.steps.execute.duration || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 📦 Products Processed | ${{ steps.execute.outputs.product_count || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 📊 File Size | $(numfmt --to=iec ${{ steps.execute.outputs.file_size || 0 }}) |" >> $GITHUB_STEP_SUMMARY
+          echo "| 📦 Products Processed | ${{ steps.execute.outputs.product_count }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 📊 File Size | $(numfmt --to=iec ${{ steps.execute.outputs.file_size }}) |" >> $GITHUB_STEP_SUMMARY
           echo "| 🎯 Status | ✅ Success |" >> $GITHUB_STEP_SUMMARY
 
       - name: 🧹 Cleanup sensitive files
         if: always()
         run: |
           rm -f /tmp/gcp_credentials.json
-          rm -rf /tmp/ftp/*
+          rm -rf /tmp/ftp/* || true
           echo "🧹 Cleanup completed"
 
   # Notification and monitoring job
@@ -275,7 +271,6 @@ jobs:
       - name: 📝 Update repository status
         if: steps.status.outputs.status == 'success'
         run: |
-          # Create/update a status file
           mkdir -p .github/status
           cat > .github/status/last_run.json << EOF
           {
@@ -286,17 +281,10 @@ jobs:
             "file_size": "${{ needs.process-merchant-feed.outputs.file_size || 0 }}"
           }
           EOF
-          
-          # Commit if there are changes (optional - requires write permissions)
-          # git config user.name "github-actions[bot]"
-          # git config user.email "github-actions[bot]@users.noreply.github.com"
-          # git add .github/status/last_run.json
-          # git commit -m "Update workflow status" || true
-          # git push || true
 
-      # Optional: Send notifications to Slack/Discord/Email
+      # Slack notification - Fixed the secrets issue
       - name: 💬 Send Slack notification
-        if: always() && secrets.SLACK_WEBHOOK_URL != ''
+        if: always()
         uses: 8398a7/action-slack@v3
         with:
           status: custom
@@ -315,12 +303,13 @@ jobs:
             }
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        continue-on-error: true
 
-  # Keep-alive job to prevent workflow disabling (GitHub disables after 60 days of inactivity)
+  # Keep-alive job to prevent workflow disabling
   keep-alive:
     name: 🔄 Keep Workflow Active
     runs-on: ubuntu-latest
-    if: always()  # Always run to maintain activity
+    if: always()
     needs: [preflight]
     
     steps:
@@ -332,9 +321,6 @@ jobs:
 
       - name: 🔄 Create activity to prevent workflow disabling
         run: |
-          # GitHub disables workflows after 60 days of no repository activity
-          # This step ensures the repository stays "active" by creating minimal activity
-          
           echo "=== Keep-Alive Maintenance ===" 
           echo "Timestamp: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
           echo "Run ID: ${{ github.run_id }}"
@@ -370,18 +356,18 @@ jobs:
           # Check recent workflow runs to monitor health
           echo "Checking recent workflow activity..."
           
-          # Get workflow runs from the last 30 days
-          RECENT_RUNS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/runs?per_page=30&created=>$(date -d '30 days ago' -u +%Y-%m-%d)" | \
-            jq -r '.total_count // 0')
+          # Get workflow runs from the last 30 days - simplified API call
+          RECENT_RUNS=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs?per_page=30" | \
+            jq -r '.workflow_runs | length')
           
-          SUCCESS_COUNT=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/runs?status=success&per_page=30&created=>$(date -d '30 days ago' -u +%Y-%m-%d)" | \
-            jq -r '.total_count // 0')
+          SUCCESS_COUNT=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs?status=success&per_page=30" | \
+            jq -r '.workflow_runs | length')
           
-          echo "📊 Workflow Statistics (Last 30 Days):"
+          echo "📊 Workflow Statistics (Recent):"
           echo "   Total Runs: $RECENT_RUNS"
           echo "   Successful: $SUCCESS_COUNT"
           
@@ -422,14 +408,15 @@ jobs:
   health-check:
     name: 🏥 System Health Check
     runs-on: ubuntu-latest
-    if: github.event_name == 'schedule'  # Only run on scheduled executions
+    if: github.event_name == 'schedule'
     needs: [process-merchant-feed, keep-alive]
     
     steps:
       - name: 📊 Analyze workflow health
         run: |
           # Check recent workflow success rate
-          SUCCESS_RATE=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          SUCCESS_RATE=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${{ github.repository }}/actions/runs?per_page=10" | \
             jq '[.workflow_runs[] | select(.conclusion == "success")] | length')
           
