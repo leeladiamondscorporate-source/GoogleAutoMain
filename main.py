@@ -26,7 +26,7 @@ os.makedirs(ftp_download_dir, exist_ok=True)
 FTP_SERVER = "ftp.nivoda.net"
 FTP_PORT = 21
 FTP_USERNAME = "leeladiamondscorporate@gmail.com"
-FTP_PASSWORD = "1yH£lG4n0Mq"
+FTP_PASSWORD = "dfgthmbds"
 
 # Mapping product types to FTP file details and local save paths
 ftp_files = {
